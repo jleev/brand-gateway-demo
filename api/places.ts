@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import fetch from 'node-fetch';
 
-// Simple in-memory cache (resets if function cold-starts)
+// ---------- Simple in-memory cache (per lambda instance) ----------
 const CACHE = new Map<string, { data: any; until: number }>();
 const put = (k: string, v: any, ttlSec = 3600) => {
   CACHE.set(k, { data: v, until: Date.now() + ttlSec * 1000 });
@@ -13,14 +13,11 @@ const put = (k: string, v: any, ttlSec = 3600) => {
 const get = (k: string) => {
   const e = CACHE.get(k);
   if (!e) return null;
-  if (Date.now() > e.until) {
-    CACHE.delete(k);
-    return null;
-  }
+  if (Date.now() > e.until) { CACHE.delete(k); return null; }
   return e.data;
 };
 
-// Only allow read-only actions
+// ---------- Config ----------
 const ALLOWED = new Set([
   'searchText',
   'nearbySearch',
@@ -32,7 +29,29 @@ const ALLOWED = new Set([
 
 const GOOGLE_PLACES_BASE = 'https://places.googleapis.com/v1';
 
+// Normalize IDs: accept "ChIJ..." or "places/ChIJ..." and return raw ID.
+const normalizeId = (id: string) =>
+  id?.startsWith('places/') ? id.slice(7) : id;
+
+// Known-good default field mask for Places API v1 reviews/details
+const DEFAULT_FIELDS = [
+  'id',
+  'displayName',
+  'formattedAddress',
+  'rating',
+  'userRatingCount',
+  'reviews.rating',
+  'reviews.text.text',
+  'reviews.originalText.text',
+  'reviews.publishTime',
+  'reviews.relativePublishTimeDescription',
+  'reviews.authorAttribution.displayName',
+  'reviews.authorAttribution.uri',
+  'reviews.authorAttribution.photoUri',
+];
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-gateway-key');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
@@ -41,6 +60,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const action = (req.query.action || req.body?.action || '').toString();
   if (!ALLOWED.has(action)) return res.status(400).json({ error: 'invalid_action' });
 
+  // Gateway auth (NOT your Google key)
   const gatewayKey = req.headers['x-gateway-key'];
   if (!process.env.GATEWAY_TOKEN || gatewayKey !== process.env.GATEWAY_TOKEN) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -55,49 +75,92 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   try {
     if (action === 'batchDetails') {
-      const { placeIds = [], fields = ['id','displayName','formattedAddress','rating','userRatingCount','reviews'] } = req.body || {};
-      if (!Array.isArray(placeIds) || placeIds.length === 0) return res.status(400).json({ error: 'placeIds_required' });
-      if (placeIds.length > 50) return res.status(400).json({ error: 'too_many_placeIds_max_50' });
+      const {
+        placeIds = [],
+        fields = DEFAULT_FIELDS
+      } = req.body || {};
+      if (!Array.isArray(placeIds) || placeIds.length === 0) {
+        return res.status(400).json({ error: 'placeIds_required' });
+      }
+      if (placeIds.length > 50) {
+        return res.status(400).json({ error: 'too_many_placeIds_max_50' });
+      }
 
       const results = await Promise.all(placeIds.map(async (pid: string) => {
-        const cacheKey = `details:${pid}:${fields.sort().join(',')}`;
+        const rawId = normalizeId(pid);
+        const cacheKey = `details:${rawId}:${fields.slice().sort().join(',')}`;
         const cached = get(cacheKey);
-        if (cached) return { placeId: pid, data: cached, cached: true };
+        if (cached) return { placeId: rawId, data: cached, cached: true };
 
-        const url = `${GOOGLE_PLACES_BASE}/places/${encodeURIComponent(pid)}?fields=${encodeURIComponent(fields.join(','))}`;
-        const r = await fetch(url, {
+        let url = `${GOOGLE_PLACES_BASE}/places/${encodeURIComponent(rawId)}?fields=${encodeURIComponent(fields.join(','))}`;
+        let r = await fetch(url, {
           headers: {
             'X-Goog-Api-Key': GOOGLE_API_KEY!,
             'X-Goog-FieldMask': fields.join(',')
           }
         });
+
+        // If a field-mask error occurs, retry once with DEFAULT_FIELDS
         if (!r.ok) {
-          const t = await r.text();
-          return { placeId: pid, error: true, status: r.status, body: t };
+          const bodyText = await r.text();
+          if (r.status === 400 && /Error expanding 'fields' parameter/i.test(bodyText)) {
+            url = `${GOOGLE_PLACES_BASE}/places/${encodeURIComponent(rawId)}?fields=${encodeURIComponent(DEFAULT_FIELDS.join(','))}`;
+            r = await fetch(url, {
+              headers: {
+                'X-Goog-Api-Key': GOOGLE_API_KEY!,
+                'X-Goog-FieldMask': DEFAULT_FIELDS.join(',')
+              }
+            });
+          } else {
+            return { placeId: rawId, error: true, status: r.status, body: bodyText };
+          }
+        }
+
+        if (!r.ok) {
+          return { placeId: rawId, error: true, status: r.status, body: await r.text() };
         }
         const json = await r.json();
         put(cacheKey, json, 3600);
-        return { placeId: pid, data: json, cached: false };
+        return { placeId: rawId, data: json, cached: false };
       }));
 
       return res.json({ results });
     }
 
     if (action === 'details') {
-      const { placeId, fields = ['id','displayName','formattedAddress','rating','userRatingCount','reviews'] } = req.body || {};
+      let { placeId, fields = DEFAULT_FIELDS } = req.body || {};
       if (!placeId) return res.status(400).json({ error: 'placeId_required' });
 
-      const cacheKey = `details:${placeId}:${fields.sort().join(',')}`;
+      const rawId = normalizeId(placeId);
+      const cacheKey = `details:${rawId}:${fields.slice().sort().join(',')}`;
       const cached = get(cacheKey);
       if (cached) return res.json({ data: cached, cached: true });
 
-      const url = `${GOOGLE_PLACES_BASE}/places/${encodeURIComponent(placeId)}?fields=${encodeURIComponent(fields.join(','))}`;
-      const r = await fetch(url, {
+      let url = `${GOOGLE_PLACES_BASE}/places/${encodeURIComponent(rawId)}?fields=${encodeURIComponent(fields.join(','))}`;
+      let r = await fetch(url, {
         headers: {
           'X-Goog-Api-Key': GOOGLE_API_KEY!,
           'X-Goog-FieldMask': fields.join(',')
         }
       });
+
+      // Retry with default mask on field-mask errors
+      if (!r.ok) {
+        const bodyText = await r.text();
+        if (r.status === 400 && /Error expanding 'fields' parameter/i.test(bodyText)) {
+          fields = DEFAULT_FIELDS;
+          url = `${GOOGLE_PLACES_BASE}/places/${encodeURIComponent(rawId)}?fields=${encodeURIComponent(fields.join(','))}`;
+          r = await fetch(url, {
+            headers: {
+              'X-Goog-Api-Key': GOOGLE_API_KEY!,
+              'X-Goog-FieldMask': fields.join(',')
+            }
+          });
+        } else {
+          return res.status(r.status).json({ error: 'google_error', body: bodyText });
+        }
+      }
+
       if (!r.ok) return res.status(r.status).json({ error: 'google_error', body: await r.text() });
       const json = await r.json();
       put(cacheKey, json, 3600);
