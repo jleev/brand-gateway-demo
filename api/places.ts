@@ -33,7 +33,7 @@ const GOOGLE_PLACES_BASE = 'https://places.googleapis.com/v1';
 const normalizeId = (id: string) =>
   id?.startsWith('places/') ? id.slice(7) : id;
 
-// Known-good default field mask for Places API v1 reviews/details
+// Known-good default field mask for Places API v1 (October 2025 update)
 const DEFAULT_FIELDS = [
   'id',
   'displayName',
@@ -41,14 +41,14 @@ const DEFAULT_FIELDS = [
   'rating',
   'userRatingCount',
   'reviews.rating',
-  'reviews.text.text',
-  'reviews.originalText.text',
+  'reviews.text', // ✅ replaced .text.text and .originalText.text
   'reviews.publishTime',
   'reviews.relativePublishTimeDescription',
   'reviews.authorAttribution.displayName',
   'reviews.authorAttribution.uri',
   'reviews.authorAttribution.photoUri',
 ];
+
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // CORS
